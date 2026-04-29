@@ -137,6 +137,12 @@ def make_train_sweep(wandb_project_name: str,       # string passed to the wandb
         # TransformerClassifier
         num_encoder_layers = getattr(config, "num_encoder_layers", default_model_config.num_encoder_layers)
         dim_feedforward = getattr(config, "dim_feedforward", default_model_config.dim_feedforward)
+        # ESN
+        reservoir_size = getattr(config, "reservoir_size", default_model_config.reservoir_size)
+        spectral_radius = getattr(config, "spectral_radius", default_model_config.spectral_radius)
+        reservoir_sparsity = getattr(config, "reservoir_sparsity", default_model_config.reservoir_sparsity)
+        input_scale = getattr(config, "input_scale", default_model_config.input_scale)
+        leak_rate = getattr(config, "leak_rate", default_model_config.leak_rate)
 
         # Choose loss by config ("mse" for regression, "cross_entropy" for classification).
         loss_name = getattr(config, "loss_name", "cross_entropy")
@@ -195,6 +201,12 @@ def make_train_sweep(wandb_project_name: str,       # string passed to the wandb
                 f"{model_type}_bs{trainer_batch_size}_lr{learning_rate:.5f}"
                 f"_ed{embedding_dim}_nh{num_heads}_nl{num_encoder_layers}"
                 f"_dff{dim_feedforward}_wd{weight_decay:.5f}"
+            )
+        elif model_type == "esn":
+            run.name = (
+                f"{model_type}_bs{trainer_batch_size}_lr{learning_rate:.5f}"
+                f"_rs{reservoir_size}_sr{spectral_radius:.2f}"
+                f"_sp{reservoir_sparsity:.2f}_wd{weight_decay:.5f}"
             )
         else:
             hidden_str = "x".join(map(str, hidden_units))
@@ -268,6 +280,12 @@ def make_train_sweep(wandb_project_name: str,       # string passed to the wandb
             # --- TransformerClassifier support ---
             num_encoder_layers = num_encoder_layers,
             dim_feedforward = dim_feedforward,
+            # --- ESN support ---
+            reservoir_size = reservoir_size,
+            spectral_radius = spectral_radius,
+            reservoir_sparsity = reservoir_sparsity,
+            input_scale = input_scale,
+            leak_rate = leak_rate,
         )
 
         # DONE: Step 5: Build the model, optimizer, and criterion with build_model()
@@ -307,3 +325,85 @@ def make_train_sweep(wandb_project_name: str,       # string passed to the wandb
         print(f"✓ Run complete! Final val_loss: {results['val_loss']:.4f}, val_acc: {results['val_acc'] * 100:.2f}%")
 
     return train_sweep
+
+def get_best_sweep_run_and_config(
+    entity: str,
+    project: str,
+    sweep_id: str,
+    metric_name: str,
+    maximize: bool = True,
+):
+    """
+    Gets the best run from a W&B sweep and returns the run, config, and metric.
+
+    Parameters
+    ----------
+    entity : str
+        W&B username or team name.
+
+    project : str
+        W&B project name.
+
+    sweep_id : str
+        W&B sweep ID, not the full URL.
+
+    metric_name : str
+        Metric to rank runs by.
+
+    maximize : bool, default=True
+        True if larger metric is better, False if smaller metric is better.
+
+    Returns
+    -------
+    best_run : wandb.apis.public.Run
+        Best run object.
+
+    best_config : dict
+        Clean config from the best run.
+
+    best_metric : float
+        Best metric value.
+    """
+    api = wandb.Api()
+
+    sweep = api.sweep(f"{entity}/{project}/{sweep_id}")
+    runs = sweep.runs
+
+    best_run = None
+    best_metric = None
+
+    for run in runs:
+        if run.state != "finished":
+            continue
+
+        if metric_name not in run.summary:
+            continue
+
+        metric_value = run.summary[metric_name]
+
+        if metric_value is None:
+            continue
+
+        if best_run is None:
+            best_run = run
+            best_metric = metric_value
+        elif maximize and metric_value > best_metric:
+            best_run = run
+            best_metric = metric_value
+        elif not maximize and metric_value < best_metric:
+            best_run = run
+            best_metric = metric_value
+
+    if best_run is None:
+        raise ValueError(
+            f"No finished runs in sweep '{sweep_id}' contained metric "
+            f"'{metric_name}'."
+        )
+
+    best_config = {
+        key: value
+        for key, value in best_run.config.items()
+        if not key.startswith("_")
+    }
+
+    return best_run, best_config, best_metric

@@ -1337,16 +1337,17 @@ class GatedESNGRU(nn.Module):
 
         return self.output_head(combined_state)
 
+    def num_parameters(self) -> tuple:
+        """Return (total_params, trainable_params)."""
+        total = sum(p.numel() for p in self.parameters())
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        return total, trainable
+
 
 class ESNGatedGRUCell(nn.Module):
     """
-    Custom GRU cell with an additional ESN gate.
-
-    At each timestep, the cell computes:
-    - standard GRU update gate
-    - standard GRU reset gate
-    - standard candidate hidden state
-    - additional ESN gate deciding how much projected reservoir state to inject
+    GRU cell with an additional gate that injects an ESN reservoir state
+    at every timestep.
     """
 
     def __init__(self, input_size: int, hidden_size: int, reservoir_size: int):
@@ -1364,50 +1365,33 @@ class ESNGatedGRUCell(nn.Module):
         self.esn_gate = nn.Linear(
             input_size + hidden_size + reservoir_size,
             hidden_size,
-        )
+            )
 
     def forward(
-        self,
-        x_t: torch.Tensor,
-        h_prev: torch.Tensor,
-        r_t: torch.Tensor,
+            self,
+            x_t: torch.Tensor,
+            h_prev: torch.Tensor,
+            r_t: torch.Tensor,
     ) -> torch.Tensor:
-        """
-        Parameters
-        ----------
-        x_t:
-            Input at timestep t, shape (batch_size, input_size).
-
-        h_prev:
-            Previous GRU hidden state, shape (batch_size, hidden_size).
-
-        r_t:
-            ESN reservoir state at timestep t, shape
-            (batch_size, reservoir_size).
-
-        Returns
-        -------
-        torch.Tensor
-            Updated hidden state, shape (batch_size, hidden_size).
-        """
         combined = torch.cat([x_t, h_prev], dim=1)
 
         z_t = torch.sigmoid(self.update_gate(combined))
-        q_t = torch.sigmoid(self.reset_gate(combined))
+        reset_t = torch.sigmoid(self.reset_gate(combined))
 
-        candidate_input = torch.cat([x_t, q_t * h_prev], dim=1)
+        candidate_input = torch.cat([x_t, reset_t * h_prev], dim=1)
         h_candidate = torch.tanh(self.candidate(candidate_input))
 
         h_gru = (1.0 - z_t) * h_prev + z_t * h_candidate
 
         esn_gate_input = torch.cat([x_t, h_gru, r_t], dim=1)
-        e_t = torch.sigmoid(self.esn_gate(esn_gate_input))
+        esn_gate = torch.sigmoid(self.esn_gate(esn_gate_input))
 
         projected_r_t = torch.tanh(self.esn_projection(r_t))
 
-        h_new = (1.0 - e_t) * h_gru + e_t * projected_r_t
+        h_new = (1.0 - esn_gate) * h_gru + esn_gate * projected_r_t
 
         return h_new
+
 
 
 class StepwiseESNGatedGRU(nn.Module):
@@ -1523,3 +1507,220 @@ class StepwiseESNGatedGRU(nn.Module):
             )
 
         return self.output_head(hidden_state)
+    
+class DeepESNGatedGRU(nn.Module):
+    """
+    Deep ESN-Gated GRU.
+
+    Each layer contains:
+    - one frozen ESN reservoir
+    - one ESN-gated GRU cell
+
+    Layer 0 receives the original input sequence.
+    Higher layers receive the full hidden-state sequence from the previous layer.
+    """
+
+    def __init__(
+        self,
+        input_size: int,
+        output_size: int,
+        config: ModelConfig,
+    ):
+        super().__init__()
+
+        self.config = config
+        self.hidden_sizes = config.hidden_units
+        self.num_layers = len(self.hidden_sizes)
+        self.num_outputs = output_size
+        # Use the same reservoir size for all layers as config only has one value
+        self.reservoir_sizes = [config.reservoir_size] * self.num_layers
+        self.leak_rate = config.leak_rate
+        self.dropout = nn.Dropout(config.dropout[0])
+
+        self.W_in_layers = nn.ParameterList()
+        self.W_res_layers = nn.ParameterList()
+        self.cells = nn.ModuleList()
+
+        for layer_idx in range(self.num_layers):
+            layer_input_size = input_size if layer_idx == 0 else self.hidden_sizes[layer_idx - 1]
+            reservoir_size = self.reservoir_sizes[layer_idx]
+            hidden_size = self.hidden_sizes[layer_idx]
+
+            W_in = nn.Parameter(
+                config.input_scale * torch.randn(layer_input_size, reservoir_size),
+                requires_grad=False,
+            )
+
+            W_res = self._make_reservoir_matrix(
+                reservoir_size=reservoir_size,
+                spectral_radius=config.spectral_radius,
+                reservoir_sparsity=config.reservoir_sparsity,
+            )
+
+            W_res = nn.Parameter(W_res, requires_grad=False)
+
+            self.W_in_layers.append(W_in)
+            self.W_res_layers.append(W_res)
+
+            self.cells.append(
+                ESNGatedGRUCell(
+                    input_size=layer_input_size,
+                    hidden_size=hidden_size,
+                    reservoir_size=reservoir_size,
+                )
+            )
+
+        final_hidden_size = self.hidden_sizes[-1]
+
+        self.output_head = nn.Sequential(
+            nn.Linear(final_hidden_size, final_hidden_size),
+            nn.ReLU(),
+            nn.Dropout(config.dropout[0]),
+            nn.Linear(final_hidden_size, output_size),
+        )
+
+    def _make_reservoir_matrix(
+        self,
+        reservoir_size: int,
+        spectral_radius: float,
+        reservoir_sparsity: float,
+    ) -> torch.Tensor:
+        W_res = torch.randn(reservoir_size, reservoir_size)
+
+        mask = torch.rand(reservoir_size, reservoir_size) > reservoir_sparsity
+        W_res = W_res * mask
+
+        eigvals = torch.linalg.eigvals(W_res)
+        current_radius = eigvals.abs().max().real
+
+        if current_radius == 0:
+            raise ValueError(
+                "Reservoir matrix has spectral radius 0. "
+                "Try lowering reservoir_sparsity."
+            )
+
+        W_res = W_res * (spectral_radius / current_radius)
+
+        return W_res
+
+    def update_reservoir(
+        self,
+        x_t: torch.Tensor,
+        reservoir_state: torch.Tensor,
+        layer_idx: int,
+    ) -> torch.Tensor:
+        W_in = self.W_in_layers[layer_idx]
+        W_res = self.W_res_layers[layer_idx]
+
+        candidate_state = torch.tanh(
+            x_t @ W_in + reservoir_state @ W_res
+        )
+
+        reservoir_state = (
+            (1.0 - self.leak_rate) * reservoir_state
+            + self.leak_rate * candidate_state
+        )
+
+        return reservoir_state
+
+    def forward_layer(
+        self,
+        x: torch.Tensor,
+        layer_idx: int,
+    ) -> torch.Tensor:
+        """
+        Runs one ESN-Gated GRU layer over the full sequence.
+
+        Parameters
+        ----------
+        x:
+            Shape: (batch_size, sequence_length, layer_input_size)
+
+        Returns
+        -------
+        torch.Tensor
+            Shape: (batch_size, sequence_length, hidden_size)
+        """
+        batch_size, sequence_length, _ = x.shape
+
+        reservoir_size = self.reservoir_sizes[layer_idx]
+        hidden_size = self.hidden_sizes[layer_idx]
+
+        reservoir_state = torch.zeros(
+            batch_size,
+            reservoir_size,
+            device=x.device,
+            dtype=x.dtype,
+        )
+
+        hidden_state = torch.zeros(
+            batch_size,
+            hidden_size,
+            device=x.device,
+            dtype=x.dtype,
+        )
+
+        layer_outputs = []
+
+        for t in range(sequence_length):
+            x_t = x[:, t, :]
+
+            reservoir_state = self.update_reservoir(
+                x_t=x_t,
+                reservoir_state=reservoir_state,
+                layer_idx=layer_idx,
+            )
+
+            hidden_state = self.cells[layer_idx](
+                x_t=x_t,
+                h_prev=hidden_state,
+                r_t=reservoir_state,
+            )
+
+            layer_outputs.append(hidden_state.unsqueeze(1))
+
+        layer_outputs = torch.cat(layer_outputs, dim=1)
+
+        if layer_idx < self.num_layers - 1:
+            layer_outputs = self.dropout(layer_outputs)
+
+        return layer_outputs
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Parameters
+        ----------
+        x:
+            Shape: (batch_size, sequence_length, input_size)
+
+        Returns
+        -------
+        torch.Tensor
+            Shape: (batch_size, output_size)
+        """
+        layer_input = x
+
+        for layer_idx in range(self.num_layers):
+            layer_input = self.forward_layer(
+                x=layer_input,
+                layer_idx=layer_idx,
+            )
+
+        final_hidden_state = layer_input[:, -1, :]
+
+        return self.output_head(final_hidden_state)
+
+    def num_parameters(self) -> tuple:
+        """Return (total_params, trainable_params)."""
+        total = sum(p.numel() for p in self.parameters())
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        return total, trainable
+
+    def get_architecture_config(self) -> dict:
+        """Return a JSON-serializable description of the architecture."""
+        from dataclasses import asdict
+        return {
+            "model_class": "DeepESNGatedGRU",
+            "num_outputs": self.num_outputs,
+            "config": asdict(self.config),
+        }

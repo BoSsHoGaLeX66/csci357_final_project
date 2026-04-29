@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from typing import Tuple, Union, Optional, List
 from pathlib import Path
-from sklearn.metrics import confusion_matrix
+from sklearn.metrics import confusion_matrix, precision_score
 import numpy as np
 from src.my_engine.config import (
     ModelConfig,
@@ -10,7 +10,7 @@ from src.my_engine.config import (
     ConvBlockConfig,
     ResidualBlockConfig,
 )
-from .model import MLP_Model, CNN_Model, BagOfEmbeddings, TextCNN1D, RNNModel, TextRNNModel, AttentionClassifier, TransformerClassifier, GatedESNGRU, StepwiseESNGatedGRU
+from .model import MLP_Model, CNN_Model, BagOfEmbeddings, TextCNN1D, RNNModel, TextRNNModel, AttentionClassifier, TransformerClassifier, GatedESNGRU, StepwiseESNGatedGRU, DeepESNGatedGRU
 """
 utils.py
 
@@ -81,6 +81,10 @@ def build_model(input_spec: Union[int, List[int]], num_outputs: int, config: Mod
         if not isinstance(input_spec, int) or input_spec <= 0:
             raise ValueError("StepwiseESNGatedGRU requires input_spec as int > 0 (input_size).")
         return StepwiseESNGatedGRU(input_size=input_spec, output_size=num_outputs, config=config)
+    elif config.model_type == "deep_esn_gated_gru":
+        if not isinstance(input_spec, int) or input_spec <= 0:
+            raise ValueError("DeepESNGatedGRU requires input_spec as int > 0 (input_size).")
+        return DeepESNGatedGRU(input_size=input_spec, output_size=num_outputs, config=config)
     else:
         raise ValueError(f"Model type '{config.model_type}' not supported. Supported types: 'mlp', 'cnn'")
 
@@ -528,3 +532,90 @@ def test_eval(model, test_loader, device) -> Tuple[np.ndarray, np.ndarray]:
     all_labels = np.concatenate(all_labels)
 
     return all_preds, all_labels
+
+def get_direction_accuracy(
+        model,
+        data_loader,
+        scaler,
+        log_returns_idx: int,
+):
+    """
+    Calculates stock direction accuracy using the scaler statistics from the
+    'log_returns' column.
+
+    This version extracts only the correct column parameters from a fitted
+    sklearn scaler (such as StandardScaler or MinMaxScaler).
+
+    Direction rule after inverse scaling:
+        value > 1  -> 1
+        value <= 1 -> 0
+
+    Parameters
+    ----------
+    model : torch.nn.Module
+        Trained PyTorch model.
+
+    data_loader : torch.utils.data.DataLoader
+        DataLoader yielding (X_batch, y_batch).
+
+    scaler :
+        Fitted sklearn scaler.
+
+    log_returns_idx : int
+        Column index of the 'log_returns' feature used when fitting scaler.
+
+    Returns
+    -------
+    float
+        Direction prediction accuracy.
+    """
+    model.eval()
+
+    device = next(model.parameters()).device
+
+    all_preds = []
+    all_targets = []
+
+    with torch.no_grad():
+        for X_batch, y_batch in data_loader:
+            X_batch = X_batch.to(device)
+            y_batch = y_batch.to(device)
+
+            preds = model(X_batch)
+
+            if preds.ndim > 1 and preds.shape[1] == 1:
+                preds = preds.squeeze(1)
+
+            if y_batch.ndim > 1 and y_batch.shape[1] == 1:
+                y_batch = y_batch.squeeze(1)
+
+            all_preds.append(preds.cpu())
+            all_targets.append(y_batch.cpu())
+
+    preds = torch.cat(all_preds).numpy().flatten()
+    targets = torch.cat(all_targets).numpy().flatten()
+
+    if hasattr(scaler, "mean_") and hasattr(scaler, "scale_"):
+        mean_val = scaler.mean_[log_returns_idx]
+        scale_val = scaler.scale_[log_returns_idx]
+
+        preds_unscaled = preds * scale_val + mean_val
+        targets_unscaled = targets * scale_val + mean_val
+
+    elif hasattr(scaler, "data_min_") and hasattr(scaler, "data_max_"):
+        min_val = scaler.data_min_[log_returns_idx]
+        max_val = scaler.data_max_[log_returns_idx]
+
+        preds_unscaled = preds * (max_val - min_val) + min_val
+        targets_unscaled = targets * (max_val - min_val) + min_val
+
+    else:
+        raise ValueError(
+            "Unsupported scaler type. Use StandardScaler or MinMaxScaler."
+        )
+    pred_dirs = (preds_unscaled > 0).astype(int)
+    true_dirs = (targets_unscaled > 0).astype(int)
+    accuracy = np.mean(pred_dirs == true_dirs)
+
+
+    return float(accuracy), true_dirs, pred_dirs
