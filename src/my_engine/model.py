@@ -2,8 +2,11 @@ import math
 
 import torch
 import torch.nn as nn
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from src.my_engine.config import ModelConfig, ResidualBlockConfig
+from src.my_engine.ridge import _construct_ridge_readout, _fit_ridge_readout
+
+
 
 
 def _construct_fc_layers(start_layer_size: int, config: ModelConfig, num_outputs: int) -> nn.Sequential:
@@ -1189,6 +1192,426 @@ class TransformerClassifier(nn.Module):
             f"d_model={self.config.embedding_dim} ({frozen}), "
             f"heads={self.config.num_heads}, layers={self.config.num_encoder_layers}, "
             f"d_ff={self.config.dim_feedforward}, out={self.num_outputs})"
+        )
+
+    def __repr__(self) -> str:
+        return self.__str__()
+
+
+class ESN(nn.Module):
+    """
+    Echo State Network for continuous sequence inputs.
+
+    The input, reservoir, and readout weights are not updated with gradient
+    descent. The readout is fit in closed form with ridge regression.
+    """
+
+    def __init__(self, num_inputs: int, config: ModelConfig, num_outputs: int):
+        super().__init__()
+
+        if config.model_type not in ("esn", "deep_esn"):
+            raise ValueError(
+                f"Invalid model_type: {config.model_type}. Expected 'esn' or 'deep_esn'."
+            )
+
+        if num_inputs <= 0:
+            raise ValueError("ESN requires num_inputs > 0.")
+        if config.reservoir_size <= 0:
+            raise ValueError("ESN requires config.reservoir_size > 0.")
+        if not 0.0 <= config.leak_rate <= 1.0:
+            raise ValueError("ESN requires config.leak_rate between 0 and 1.")
+
+        self.num_inputs = num_inputs
+        self.num_outputs = num_outputs
+        self.config = config
+        self.reservoir_size = config.reservoir_size
+        self.leak_rate = config.leak_rate
+
+        self.W_in = nn.Parameter(
+            config.input_scale * torch.randn(num_inputs, self.reservoir_size),
+            requires_grad=False,
+        )
+        self.W_res = nn.Parameter(
+            self._make_reservoir_matrix(
+                reservoir_size=self.reservoir_size,
+                spectral_radius=config.spectral_radius,
+                reservoir_sparsity=config.reservoir_sparsity,
+            ),
+            requires_grad=False,
+        )
+        self.classifier_head = _construct_ridge_readout(
+            num_features=self.reservoir_size,
+            num_outputs=num_outputs,
+        )
+
+    def _make_reservoir_matrix(
+        self,
+        reservoir_size: int,
+        spectral_radius: float,
+        reservoir_sparsity: float,
+    ) -> torch.Tensor:
+        W_res = torch.randn(reservoir_size, reservoir_size)
+        mask = torch.rand(reservoir_size, reservoir_size) > reservoir_sparsity
+        W_res = W_res * mask
+
+        eigvals = torch.linalg.eigvals(W_res)
+        current_radius = eigvals.abs().max().real
+
+        if current_radius == 0:
+            raise ValueError(
+                "Reservoir matrix has spectral radius 0. "
+                "Try lowering reservoir_sparsity."
+            )
+
+        return W_res * (spectral_radius / current_radius)
+
+    def update_reservoir(
+        self,
+        x_t: torch.Tensor,
+        reservoir_state: torch.Tensor,
+    ) -> torch.Tensor:
+        candidate_state = torch.tanh(
+            x_t @ self.W_in + reservoir_state @ self.W_res
+        )
+        return (
+            (1.0 - self.leak_rate) * reservoir_state
+            + self.leak_rate * candidate_state
+        )
+
+    def compute_reservoir_states(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Compute the full sequence of reservoir states.
+
+        Args:
+            x: Tensor with shape (batch_size, sequence_length, num_inputs).
+
+        Returns:
+            Tensor with shape (batch_size, sequence_length, reservoir_size).
+        """
+        if x.dim() != 3:
+            raise ValueError(
+                "ESN input must have shape (batch_size, sequence_length, num_inputs)."
+            )
+        if x.size(-1) != self.num_inputs:
+            raise ValueError(
+                f"Expected input feature size {self.num_inputs}, got {x.size(-1)}."
+            )
+
+        batch_size, sequence_length, _ = x.shape
+        reservoir_state = torch.zeros(
+            batch_size,
+            self.reservoir_size,
+            device=x.device,
+            dtype=x.dtype,
+        )
+
+        states = []
+        for t in range(sequence_length):
+            reservoir_state = self.update_reservoir(
+                x_t=x[:, t, :],
+                reservoir_state=reservoir_state,
+            )
+            states.append(reservoir_state.unsqueeze(1))
+
+        return torch.cat(states, dim=1)
+
+    def compute_readout_features(self, x: torch.Tensor) -> torch.Tensor:
+        reservoir_states = self.compute_reservoir_states(x)
+        return reservoir_states[:, -1, :]
+
+    def fit_ridge(
+        self,
+        features: torch.Tensor,
+        targets: torch.Tensor,
+        ridge_alpha: float = 1.0,
+    ) -> None:
+        _fit_ridge_readout(
+            readout=self.classifier_head,
+            features=features,
+            targets=targets,
+            num_outputs=self.num_outputs,
+            ridge_alpha=ridge_alpha,
+        )
+
+    def fit_ridge_from_loader(
+        self,
+        train_loader,
+        ridge_alpha: float = 1.0,
+        device: torch.device | None = None,
+    ) -> None:
+        device = device or next(self.parameters()).device
+        was_training = self.training
+        self.eval()
+        features = []
+        targets = []
+        with torch.no_grad():
+            for inputs, batch_targets in train_loader:
+                inputs = inputs.to(device)
+                features.append(self.compute_readout_features(inputs).cpu())
+                targets.append(batch_targets.cpu())
+
+        self.fit_ridge(
+            features=torch.cat(features, dim=0).to(device),
+            targets=torch.cat(targets, dim=0).to(device),
+            ridge_alpha=ridge_alpha,
+        )
+        self.train(was_training)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        final_state = self.compute_readout_features(x)
+        return self.classifier_head(final_state)
+
+    def num_parameters(self) -> tuple[int, int]:
+        total = sum(p.numel() for p in self.parameters())
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        return total, trainable
+
+    def get_architecture_config(self) -> dict:
+        return {
+            "model_type": self.config.model_type,
+            "num_inputs": self.num_inputs,
+            "num_outputs": self.num_outputs,
+            "config": asdict(self.config),
+        }
+
+    def __str__(self) -> str:
+        return (
+            f"ESN(input={self.num_inputs}, reservoir={self.reservoir_size}, "
+            f"spectral_radius={self.config.spectral_radius}, "
+            f"leak_rate={self.leak_rate}, out={self.num_outputs})"
+        )
+
+    def __repr__(self) -> str:
+        return self.__str__()
+
+
+class DeepESN(nn.Module):
+    """
+    Deep Echo State Network built by stacking ESN reservoir layers.
+
+    Each layer receives the full reservoir-state sequence from the previous
+    layer. A single linear readout is fit in closed form with ridge regression.
+    """
+
+    def __init__(self, num_inputs: int, config: ModelConfig, num_outputs: int):
+        super().__init__()
+
+        if config.model_type != "deep_esn":
+            raise ValueError(f"Invalid model_type: {config.model_type}. Expected 'deep_esn'.")
+        if num_inputs <= 0:
+            raise ValueError("DeepESN requires num_inputs > 0.")
+        if config.rnn_num_layers <= 0:
+            raise ValueError("DeepESN requires config.rnn_num_layers > 0.")
+
+        self.num_inputs = num_inputs
+        self.num_outputs = num_outputs
+        self.config = config
+        self.num_layers = config.rnn_num_layers
+        self.reservoir_size = config.reservoir_size
+
+        self.esn_layers = nn.ModuleList()
+        for layer_idx in range(self.num_layers):
+            layer_inputs = num_inputs if layer_idx == 0 else self.reservoir_size
+            esn_layer = ESN(
+                num_inputs=layer_inputs,
+                config=config,
+                num_outputs=self.reservoir_size,
+            )
+            esn_layer.classifier_head = nn.Identity()
+            self.esn_layers.append(esn_layer)
+
+        dropout_p = config.dropout[0] if config.dropout else 0.0
+        self.dropout = nn.Dropout(dropout_p)
+        self.classifier_head = _construct_ridge_readout(
+            num_features=self.reservoir_size,
+            num_outputs=num_outputs,
+        )
+
+    def compute_readout_features(self, x: torch.Tensor) -> torch.Tensor:
+        layer_output = x
+        for layer_idx, esn_layer in enumerate(self.esn_layers):
+            layer_output = esn_layer.compute_reservoir_states(layer_output)
+            if layer_idx < self.num_layers - 1:
+                layer_output = self.dropout(layer_output)
+
+        return layer_output[:, -1, :]
+
+    def fit_ridge(
+        self,
+        features: torch.Tensor,
+        targets: torch.Tensor,
+        ridge_alpha: float = 1.0,
+    ) -> None:
+        _fit_ridge_readout(
+            readout=self.classifier_head,
+            features=features,
+            targets=targets,
+            num_outputs=self.num_outputs,
+            ridge_alpha=ridge_alpha,
+        )
+
+    def fit_ridge_from_loader(
+        self,
+        train_loader,
+        ridge_alpha: float = 1.0,
+        device: torch.device | None = None,
+    ) -> None:
+        device = device or next(self.parameters()).device
+        was_training = self.training
+        self.eval()
+        features = []
+        targets = []
+        with torch.no_grad():
+            for inputs, batch_targets in train_loader:
+                inputs = inputs.to(device)
+                features.append(self.compute_readout_features(inputs).cpu())
+                targets.append(batch_targets.cpu())
+
+        self.fit_ridge(
+            features=torch.cat(features, dim=0).to(device),
+            targets=torch.cat(targets, dim=0).to(device),
+            ridge_alpha=ridge_alpha,
+        )
+        self.train(was_training)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        final_state = self.compute_readout_features(x)
+        return self.classifier_head(final_state)
+
+    def num_parameters(self) -> tuple[int, int]:
+        total = sum(p.numel() for p in self.parameters())
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        return total, trainable
+
+    def get_architecture_config(self) -> dict:
+        return {
+            "model_type": self.config.model_type,
+            "num_inputs": self.num_inputs,
+            "num_outputs": self.num_outputs,
+            "config": asdict(self.config),
+        }
+
+    def __str__(self) -> str:
+        return (
+            f"DeepESN(input={self.num_inputs}, layers={self.num_layers}, "
+            f"reservoir={self.reservoir_size}, out={self.num_outputs})"
+        )
+
+    def __repr__(self) -> str:
+        return self.__str__()
+
+
+class ESNForest(nn.Module):
+    """
+    Ensemble of randomly initialized ESN and DeepESN models.
+
+    Each member samples its reservoir size, depth, leak rate, sparsity,
+    spectral radius, and input scale from the ranges/lists in ModelConfig.
+    Member outputs are averaged to produce the final prediction.
+    """
+
+    def __init__(self, num_inputs: int, config: ModelConfig, num_outputs: int):
+        super().__init__()
+
+        if config.model_type != "esn_forest":
+            raise ValueError(f"Invalid model_type: {config.model_type}. Expected 'esn_forest'.")
+        if num_inputs <= 0:
+            raise ValueError("ESNForest requires num_inputs > 0.")
+        if config.number_esns <= 0:
+            raise ValueError("ESNForest requires config.number_esns > 0.")
+        if not config.resevior_sizes:
+            raise ValueError("ESNForest requires at least one reservoir size.")
+        if not config.esn_depths:
+            raise ValueError("ESNForest requires at least one ESN depth.")
+
+        self.num_inputs = num_inputs
+        self.num_outputs = num_outputs
+        self.config = config
+        self.member_configs = []
+        self.esns = nn.ModuleList()
+
+        self._validate_positive_int_list(config.resevior_sizes, "resevior_sizes")
+        self._validate_positive_int_list(config.esn_depths, "esn_depths")
+        self._validate_range(config.leak_rate_range, "leak_rate_range")
+        self._validate_range(config.reservoir_sparsity_range, "reservoir_sparsity_range")
+        self._validate_range(config.spectral_radius_range, "spectral_radius_range")
+        self._validate_range(config.input_scale_range, "input_scale_range")
+
+        for _ in range(config.number_esns):
+            reservoir_size = self._sample_choice(config.resevior_sizes)
+            depth = self._sample_choice(config.esn_depths)
+            model_type = "esn" if depth <= 1 else "deep_esn"
+
+            member_config = replace(
+                config,
+                model_type=model_type,
+                reservoir_size=reservoir_size,
+                rnn_num_layers=depth,
+                leak_rate=self._sample_uniform(config.leak_rate_range),
+                reservoir_sparsity=self._sample_uniform(config.reservoir_sparsity_range),
+                spectral_radius=self._sample_uniform(config.spectral_radius_range),
+                input_scale=self._sample_uniform(config.input_scale_range),
+            )
+
+            if model_type == "esn":
+                member = ESN(
+                    num_inputs=num_inputs,
+                    config=member_config,
+                    num_outputs=num_outputs,
+                )
+            else:
+                member = DeepESN(
+                    num_inputs=num_inputs,
+                    config=member_config,
+                    num_outputs=num_outputs,
+                )
+
+            self.member_configs.append(member_config)
+            self.esns.append(member)
+
+    def _validate_positive_int_list(self, values: list[int], name: str) -> None:
+        for value in values:
+            if value <= 0:
+                raise ValueError(f"ESNForest requires all {name} values to be > 0.")
+
+    def _validate_range(self, values: tuple[float, float], name: str) -> None:
+        if len(values) != 2:
+            raise ValueError(f"ESNForest requires {name} to contain exactly two values.")
+
+        low, high = values
+        if low > high:
+            raise ValueError(f"ESNForest requires {name}[0] <= {name}[1].")
+
+    def _sample_choice(self, values: list[int]) -> int:
+        index = torch.randint(len(values), (1,)).item()
+        return values[index]
+
+    def _sample_uniform(self, values: tuple[float, float]) -> float:
+        low, high = values
+        return torch.empty(1).uniform_(low, high).item()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        member_outputs = [member(x).unsqueeze(0) for member in self.esns]
+        return torch.cat(member_outputs, dim=0).mean(dim=0)
+
+    def num_parameters(self) -> tuple[int, int]:
+        total = sum(p.numel() for p in self.parameters())
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        return total, trainable
+
+    def get_architecture_config(self) -> dict:
+        return {
+            "model_type": self.config.model_type,
+            "num_inputs": self.num_inputs,
+            "num_outputs": self.num_outputs,
+            "config": asdict(self.config),
+            "member_configs": [asdict(member_config) for member_config in self.member_configs],
+        }
+
+    def __str__(self) -> str:
+        return (
+            f"ESNForest(input={self.num_inputs}, members={len(self.esns)}, "
+            f"out={self.num_outputs})"
         )
 
     def __repr__(self) -> str:

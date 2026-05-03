@@ -19,6 +19,7 @@ import torchmetrics
 
 from my_engine.config import TrainerConfig, ModelConfig, MetricsConfig
 from my_engine.utils import accuracy_from_logits, make_lr_scheduler, get_preds
+from src.my_engine.ridge import _prepare_ridge_targets
 
 METRIC_REGISTRY = {
     'accuracy': torchmetrics.Accuracy,
@@ -455,3 +456,112 @@ class Trainer:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.finish_run()
+
+
+class RidgeRegressionTrainer:
+    """
+    Minimal trainer for ESN-style models with closed-form ridge readouts.
+
+    This intentionally does not use an optimizer or backpropagation. The model
+    must provide ``fit_ridge_from_loader``.
+
+    Parameters:
+        model: Model with a ``fit_ridge_from_loader`` method.
+        criterion: Loss function used when reporting train/validation loss.
+        config: Optional TrainerConfig-like object. Its device is used when present.
+        ridge_alpha: Ridge regularization strength.
+        run: Optional W&B run. When provided, train_loss and val_loss are logged
+            with ``wandb.log`` after the ridge readout has been fit.
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        criterion=None,
+        config=None,
+        ridge_alpha: float = 1.0,
+        run: Optional[wandb.Run] = None,
+    ) -> None:
+        if not hasattr(model, "fit_ridge_from_loader"):
+            raise TypeError("RidgeRegressionTrainer requires a model with fit_ridge_from_loader.")
+        if ridge_alpha < 0:
+            raise ValueError("ridge_alpha must be non-negative.")
+
+        self.config = config
+        self.device = getattr(config, "device", torch.device("cpu"))
+        self.model = model.to(self.device)
+        self.criterion = criterion if criterion is not None else nn.MSELoss()
+        self.ridge_alpha = ridge_alpha
+        self.run = run
+
+    def fit(self, train_loader, val_loader=None) -> dict:
+        self.model.fit_ridge_from_loader(
+            train_loader=train_loader,
+            ridge_alpha=self.ridge_alpha,
+            device=self.device,
+        )
+        train_loss, train_acc = self.validate(train_loader)
+        results = {
+            "train_loss": train_loss,
+            "train_acc": train_acc,
+        }
+
+        if val_loader is not None:
+            val_loss, val_acc = self.validate(val_loader)
+            results.update(
+                {
+                    "val_loss": val_loss,
+                    "val_acc": val_acc,
+                }
+            )
+
+        if self.run is not None:
+            wandb.log({
+                "train_loss": results["train_loss"],
+                "val_loss": results.get("val_loss"),
+            })
+            self.run.finish()
+
+        return results
+
+    def validate(self, data_loader) -> tuple[float, float]:
+        self.model.eval()
+        total_loss = 0.0
+        total_acc = 0.0
+        total_samples = 0
+
+        with torch.no_grad():
+            for inputs, targets in data_loader:
+                inputs = inputs.to(self.device)
+                targets = targets.to(self.device)
+                outputs = self.model(inputs)
+
+                loss_targets = targets
+                if isinstance(self.criterion, (nn.MSELoss, nn.L1Loss, nn.SmoothL1Loss)):
+                    loss_targets = _prepare_ridge_targets(targets, outputs.shape[1])
+
+                if outputs.shape[1] == 1:
+                    loss = self.criterion(outputs.squeeze(), loss_targets.squeeze())
+                else:
+                    loss = self.criterion(outputs, loss_targets)
+
+                batch_size = inputs.size(0)
+                total_loss += loss.item() * batch_size
+                total_acc += self._accuracy(outputs, targets) * batch_size
+                total_samples += batch_size
+
+        if total_samples == 0:
+            return 0.0, 0.0
+
+        return total_loss / total_samples, total_acc / total_samples
+
+    def _accuracy(self, outputs: torch.Tensor, targets: torch.Tensor) -> float:
+        if torch.is_floating_point(targets):
+            return 0.0
+
+        if outputs.shape[1] == 1:
+            preds = (outputs.squeeze() >= 0.5).long()
+        else:
+            preds = outputs.argmax(dim=1)
+
+        return (preds == targets.long().view_as(preds)).float().mean().item()

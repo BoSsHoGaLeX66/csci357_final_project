@@ -12,7 +12,7 @@ Date: 02/17/2026
 
 from dataclasses import dataclass, field
 import torch
-from typing import List, Optional, Union
+from typing import List, Optional, Tuple, Union
 from torchmetrics import Metric
 
 
@@ -156,5 +156,12 @@ class ModelConfig:
     reservoir_sparsity: float = 0.9
     input_scale: float = 0.5
     leak_rate: float = 1.0
-
+    # --- ESNForest fields ---
+    resevior_sizes: List[int] = field(default_factory=lambda: [100, 250, 500])
+    esn_depths: List[int] = field(default_factory=lambda: [1, 2, 3])
+    leak_rate_range: Tuple[float, float] = (0.1, 1.0)
+    reservoir_sparsity_range: Tuple[float, float] = (0.1, 0.9)
+    spectral_radius_range: Tuple[float, float] = (0.1, 1.2)
+    input_scale_range: Tuple[float, float] = (0.1, 1.0)
+    number_esns: int = 5
 

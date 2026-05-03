@@ -10,7 +10,7 @@ from src.my_engine.config import (
     ConvBlockConfig,
     ResidualBlockConfig,
 )
-from .model import MLP_Model, CNN_Model, BagOfEmbeddings, TextCNN1D, RNNModel, TextRNNModel, AttentionClassifier, TransformerClassifier, GatedESNGRU, StepwiseESNGatedGRU, DeepESNGatedGRU
+from .model import MLP_Model, CNN_Model, BagOfEmbeddings, TextCNN1D, RNNModel, TextRNNModel, AttentionClassifier, TransformerClassifier, ESN, DeepESN, ESNForest, GatedESNGRU, StepwiseESNGatedGRU, DeepESNGatedGRU
 """
 utils.py
 
@@ -73,6 +73,18 @@ def build_model(input_spec: Union[int, List[int]], num_outputs: int, config: Mod
         return AttentionClassifier(num_outputs=num_outputs, config=config)
     elif config.model_type == "text_transformer":
         return TransformerClassifier(num_outputs=num_outputs, config=config)
+    elif config.model_type == "esn":
+        if not isinstance(input_spec, int) or input_spec <= 0:
+            raise ValueError("ESN requires input_spec as int > 0 (features per time step).")
+        return ESN(num_inputs=input_spec, config=config, num_outputs=num_outputs)
+    elif config.model_type == "deep_esn":
+        if not isinstance(input_spec, int) or input_spec <= 0:
+            raise ValueError("DeepESN requires input_spec as int > 0 (features per time step).")
+        return DeepESN(num_inputs=input_spec, config=config, num_outputs=num_outputs)
+    elif config.model_type == "esn_forest":
+        if not isinstance(input_spec, int) or input_spec <= 0:
+            raise ValueError("ESNForest requires input_spec as int > 0 (features per time step).")
+        return ESNForest(num_inputs=input_spec, config=config, num_outputs=num_outputs)
     elif config.model_type == "gated_esn_gru":
         if not isinstance(input_spec, int) or input_spec <= 0:
             raise ValueError("GatedESNGRU requires input_spec as int > 0 (input_size).")
@@ -155,7 +167,9 @@ def load_model_from_checkpoint(checkpoint_path: Union[str, Path],
             "TextCNN1D": "textcnn",
             "RNNModel": "rnn",
             "TextRNNModel": "text_rnn",
-            "AttentionClassifier": "attn_text"
+            "AttentionClassifier": "attn_text",
+            "ESN": "esn",
+            "DeepESN": "deep_esn",
         }
         model_type = dict_class_to_type.get(model_class)
 
@@ -206,6 +220,18 @@ def load_model_from_checkpoint(checkpoint_path: Union[str, Path],
         model = TransformerClassifier(
             num_outputs=arch["num_outputs"],
             config=config,
+        )
+    elif model_type == "esn":
+        model = ESN(
+            num_inputs=arch["num_inputs"],
+            config=config,
+            num_outputs=arch["num_outputs"],
+        )
+    elif model_type == "deep_esn":
+        model = DeepESN(
+            num_inputs=arch["num_inputs"],
+            config=config,
+            num_outputs=arch["num_outputs"],
         )
     else:
         raise ValueError(f"Unknown model_type: {model_type}")

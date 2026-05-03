@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader
 from torchmetrics import Metric
 from my_engine.config import TrainerConfig, ModelConfig, ConvBlockConfig, ResidualBlockConfig, MetricsConfig
 from my_engine.utils import build_model, make_optimizer
-from my_engine.trainer import Trainer
+from my_engine.trainer import RidgeRegressionTrainer, Trainer
 from my_engine.data import get_dataloaders
 from my_engine.text import text_collate_fn
 
@@ -65,7 +65,8 @@ def make_train_sweep(wandb_project_name: str,       # string passed to the wandb
                         wandb_entity_name: Optional[str] = None,
                         metrics: dict[str, Metric] = None,
                         metrics_config: MetricsConfig = None,
-                        wandb_name_prefix: Optional[str] = None):
+                        wandb_name_prefix: Optional[str] = None,
+                        trainer_type=Trainer):
     """
     Factory function that populates train_sweep with the right data so it can be reused for different sweeps
 
@@ -76,8 +77,22 @@ def make_train_sweep(wandb_project_name: str,       # string passed to the wandb
     :param num_outputs: the number of outputs to the model
     :param wandb_entity_name: the name of the entity to log to
     :param metrics: the metrics to be used with this sweep
+    :param metrics_config: optional MetricsConfig for torchmetrics-based evaluation
+    :param wandb_name_prefix: optional prefix to prepend to generated W&B run names
+    :param trainer_type: trainer class or string alias to use. Defaults to Trainer.
+        Use Trainer/"trainer" for gradient descent or RidgeRegressionTrainer/"ridge" for ridge readout fitting.
     :return: populated train_sweep function
     """
+    if trainer_type in (Trainer, "Trainer", "trainer"):
+        trainer_cls = Trainer
+    elif trainer_type in (RidgeRegressionTrainer, "RidgeRegressionTrainer", "ridge", "ridge_regression"):
+        trainer_cls = RidgeRegressionTrainer
+    else:
+        raise ValueError(
+            "trainer_type must be Trainer, RidgeRegressionTrainer, "
+            "'trainer', or 'ridge'."
+        )
+
     def train_sweep():
         # Step 1: Initialize a W&B run
         # The sweep controller will automatically populate wandb.config with hyperparameters
@@ -143,6 +158,7 @@ def make_train_sweep(wandb_project_name: str,       # string passed to the wandb
         reservoir_sparsity = getattr(config, "reservoir_sparsity", default_model_config.reservoir_sparsity)
         input_scale = getattr(config, "input_scale", default_model_config.input_scale)
         leak_rate = getattr(config, "leak_rate", default_model_config.leak_rate)
+        ridge_alpha = getattr(config, "ridge_alpha", 1.0)
 
         # Choose loss by config ("mse" for regression, "cross_entropy" for classification).
         loss_name = getattr(config, "loss_name", "cross_entropy")
@@ -296,7 +312,9 @@ def make_train_sweep(wandb_project_name: str,       # string passed to the wandb
         )
 
         # DONE: Use make_optimizer() to create an optimizer using trainer_config
-        optimizer = make_optimizer(model.parameters(), config=trainer_config)
+        optimizer = None
+        if trainer_cls is Trainer:
+            optimizer = make_optimizer(model.parameters(), config=trainer_config)
 
         # Build criterion from the sweep config.
         if loss_name == "mse":
@@ -308,19 +326,31 @@ def make_train_sweep(wandb_project_name: str,       # string passed to the wandb
 
         # DONE: Step 6: Create the Trainer and train!
         # IMPORTANT: Pass run=run so the Trainer logs to THIS W&B run
-        trainer = Trainer(
-            model=model,
-            optimizer=optimizer,
-            criterion=criterion,
-            config=trainer_config,
-            run=run,
-            metrics_config=metrics_config,
-        )
+        if trainer_cls is RidgeRegressionTrainer:
+            trainer = trainer_cls(
+                model=model,
+                criterion=criterion,
+                config=trainer_config,
+                ridge_alpha=ridge_alpha,
+                run=run,
+            )
+        else:
+            trainer = trainer_cls(
+                model=model,
+                optimizer=optimizer,
+                criterion=criterion,
+                config=trainer_config,
+                run=run,
+                metrics_config=metrics_config,
+            )
         # Train the model
         results = trainer.fit(train_loader, val_loader)
 
         # Step 7: Clean up
-        trainer.finish_run()
+        if hasattr(trainer, "finish_run"):
+            trainer.finish_run()
+        elif run is not None:
+            run.finish()
 
         print(f"✓ Run complete! Final val_loss: {results['val_loss']:.4f}, val_acc: {results['val_acc'] * 100:.2f}%")
 

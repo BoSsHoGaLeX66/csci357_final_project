@@ -269,9 +269,13 @@ def make_sequences(X, y, sequence_length: int = 30, horizon: int = 1):
 def make_single_stock_df(ticker: str, period:str = "5y", train_split: float = 0.8, val_split:float = 0.1, window_size:int = 30):
     df = yf.download(ticker, period=period)
     df['log_returns'] = np.log(df['Close'].shift(1) / df['Close'])
+    df['open_close'] = (df['Open'] - df['Close']) / df['Close']
+    df['overnight_gap'] = (df['Open'] - df['Close'].shift(1)) / df['Open']
+    df['ret_1'] = df['Close'].pct_change(1)
+    df['ret_5'] = df['Close'].pct_change(5)
     df['log_volume'] = np.log(df['Volume'])
     df['log_intraday_chng'] = np.log(df['High'] / df['Low'])
-    df['log_variance'] = df['log_intraday_chng'].rolling(5).mean()
+    df['variance'] = df['ret_1'].rolling(10).std()
     df['10_log_returns_ma'] = df['log_returns'].rolling(10).mean()
     df['20_log_returns_ma'] = df['log_returns'].rolling(20).mean()
     df['50_log_returns_ma'] = df['log_returns'].rolling(50).mean()
@@ -289,8 +293,8 @@ def make_single_stock_df(ticker: str, period:str = "5y", train_split: float = 0.
     if test_idx:
         test_df = df.iloc[test_idx:]
 
-    features = ['log_returns', 'log_volume', 'log_intraday_chng', 'log_variance', '10_log_returns_ma',
-                '20_log_returns_ma', '50_log_returns_ma']
+    features = ['log_returns', 'log_volume', 'log_intraday_chng', '10_log_returns_ma',
+                '20_log_returns_ma', '50_log_returns_ma', 'open_close', 'overnight_gap', 'ret_1', 'ret_5', 'variance']
     scaler = StandardScaler()
 
     train_scaled = pd.DataFrame(scaler.fit_transform(train_df[features]), columns=train_df[features].columns)
@@ -316,4 +320,4 @@ def make_single_stock_df(ticker: str, period:str = "5y", train_split: float = 0.
     if test_idx:
         test_ds = generate_sequence(test_scaled)
 
-    return train_ds, val_ds, test_ds, scaler
+    return train_ds, val_ds, test_ds, scaler, features
