@@ -8,7 +8,7 @@ implementations in `models.py` I directed it what to do and it did it for me and
 sure that it was correct and did what I wanted. I also had AI write some of my experiments in the notebooks as these followed
 a very similar pattern and was easy for it to replicate. I would have it create sweeps for me and then I would go in and update
 the parameters to better values. AI also created the new RidgeRegressionTrainer to train the ESNs. AI also wrote a lot of the new 
-helper functions for creating the stock datasets like `build_stock_feature_df`. Also the `README.md` was written by AI mostly.
+helper functions for creating the stock datasets like `build_stock_feature_df`. Also the `README.md` was written by AI mostly with credits added by me.
 Also the beginning of `ESN Exploration.ipynb` was written by AI and it did some weird stuff that I did not ask it to do.
 
 ## **What was my own**

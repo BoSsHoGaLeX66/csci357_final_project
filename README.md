@@ -1,4 +1,6 @@
-# Hybrid GRU-ESN Models for Stock Prediction
+# Final Project For CSCI 357: Hybrid GRU-ESN Models for Stock Prediction
+
+**Credits**: `my_engine` is adapted from the one created by Professor Brain King (Bucknell University) for CSCI 357: AI and Nueral Networks.
 
 This project explores neural network architectures for stock-return prediction, with a focus on Echo State Networks (ESNs) and custom GRU-ESN hybrid models. The experiments use historical stock features to predict log returns, then evaluate models by directional accuracy: whether the model correctly predicts the sign of the next price movement.
 
