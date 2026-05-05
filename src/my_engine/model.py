@@ -1590,6 +1590,23 @@ class ESNForest(nn.Module):
         low, high = values
         return torch.empty(1).uniform_(low, high).item()
 
+    def fit_ridge_from_loader(
+        self,
+        train_loader,
+        ridge_alpha: float = 1.0,
+        device: torch.device | None = None,
+    ) -> None:
+        device = device or next(self.parameters()).device
+        was_training = self.training
+        self.eval()
+        for member in self.esns:
+            member.fit_ridge_from_loader(
+                train_loader=train_loader,
+                ridge_alpha=ridge_alpha,
+                device=device,
+            )
+        self.train(was_training)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         member_outputs = [member(x).unsqueeze(0) for member in self.esns]
         return torch.cat(member_outputs, dim=0).mean(dim=0)
