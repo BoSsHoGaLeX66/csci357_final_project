@@ -2,6 +2,8 @@
 
 **Credits**: `my_engine` is adapted from the one created by Professor Brain King (Bucknell University) for CSCI 357: AI and Nueral Networks.
 
+**Video**: Can be found [here](https://mediaspace.bucknell.edu/media/CSCI+357%3A+AI+and+Neural+Networks+Final+Project/1_hd9g6a5p).
+
 This project explores neural network architectures for stock-return prediction, with a focus on Echo State Networks (ESNs) and custom GRU-ESN hybrid models. The experiments use historical stock features to predict log returns, then evaluate models by directional accuracy: whether the model correctly predicts the sign of the next price movement.
 
 The core implementation lives in `src/my_engine/model.py`, with training utilities in `src/my_engine/trainer.py` and experimental analysis in `notebooks/Report.ipynb`.
